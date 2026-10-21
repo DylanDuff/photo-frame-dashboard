@@ -15,6 +15,7 @@ import android.net.ConnectivityManager;
 import android.net.NetworkInfo;
 import android.net.Uri;
 import android.net.http.SslError;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -27,6 +28,7 @@ import android.view.InputDevice;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.WindowManager;
+import android.webkit.JavascriptInterface;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebResourceResponse;
@@ -59,6 +61,7 @@ import java.util.Map;
  * - Offer the kiosk as a Home app (--ez home false undoes it), then pick it:
  *     adb shell am start -n com.wesbos.homehq/.MainActivity --ez home true
  *     adb shell cmd package set-home-activity com.wesbos.homehq/.Home
+ * - The saved URL's page gets window.HomeHQ: screen sleep/dim/wake, brightness and reload (Bridge).
  */
 public class MainActivity extends Activity {
   static final String TAG = "HomeHQ";
@@ -75,6 +78,8 @@ public class MainActivity extends Activity {
   static final String LOCAL_HOST = "127.0.0.1";
   static final int LOCAL_PORT = 8765;
   static final String LOCAL_ASSETS = "site";
+  static final String EXTRA_WAKE = "wake";
+  static final String BRIDGE_NAME = "HomeHQ";
 
   private WebView web;
   private final Handler handler = new Handler(Looper.getMainLooper());
@@ -85,12 +90,14 @@ public class MainActivity extends Activity {
   private final float[] exitY = new float[2];
   private boolean exitArmed;
   private String retryUrl;
-  private String mainUrl;
+  // Read by the page bridge on WebView's bridge thread.
+  private volatile String mainUrl;
   private boolean pageFailed;
   // A retry is queued: keep the offline screen up until it runs, even if the failed load "finishes".
   private boolean retryPending;
   private LinearLayout offline;
   private TextView offlineTitle, offlineText;
+  private ScreenControl screen;
 
   private final Runnable retry = new Runnable() {
     @Override
@@ -158,6 +165,9 @@ public class MainActivity extends Activity {
         | WindowManager.LayoutParams.FLAG_FULLSCREEN);
 
     web = new WebView(this);
+    // Android 8+ outlines a focused view that gains focus outside touch mode, which is the case
+    // after the screen wakes without a touch: a thin yellow-green frame around the dashboard.
+    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) web.setDefaultFocusHighlightEnabled(false);
     WebSettings s = web.getSettings();
     s.setJavaScriptEnabled(true);
     s.setDomStorageEnabled(true);
@@ -235,7 +245,10 @@ public class MainActivity extends Activity {
     FrameLayout root = new FrameLayout(this);
     root.addView(web);
     root.addView(buildOffline());
+    screen = new ScreenControl(this, root, this::notifyPage);
+    web.addJavascriptInterface(new Bridge(), BRIDGE_NAME);
     setContentView(root);
+    applyWakeFlag(getIntent());
 
     String url = urlFrom(getIntent());
     load(url != null ? url : savedUrl());
@@ -249,6 +262,7 @@ public class MainActivity extends Activity {
   protected void onResume() {
     super.onResume();
     NavigationService.setDashboardVisible(true);
+    screen.onResume();
   }
 
   @Override
@@ -264,6 +278,7 @@ public class MainActivity extends Activity {
     setIntent(intent);
     applyDebugFlag(intent);
     applyHomeFlag(intent);
+    applyWakeFlag(intent);
     String url = urlFrom(intent);
     if (url != null) {
       handler.removeCallbacks(retry);
@@ -311,6 +326,55 @@ public class MainActivity extends Activity {
 
   private String savedUrl() {
     return getSharedPreferences(PREFS, MODE_PRIVATE).getString(PREF_URL, DEFAULT_URL);
+  }
+
+  /**
+   * window.HomeHQ (kiosk README, "Screen commands from the page"). Answers only while the main
+   * page is on the saved URL's origin, so a sign-in page or other site opened in the kiosk can't
+   * use it. Methods run on WebView's bridge thread; changes are posted to the UI thread.
+   */
+  private class Bridge {
+    @JavascriptInterface public boolean sleep() { return sleep(0); }
+    @JavascriptInterface public boolean sleep(long wakeAt) { return run(() -> screen.sleep(wakeAt, true)); }
+    @JavascriptInterface public boolean dim() { return dim(0); }
+    @JavascriptInterface public boolean dim(long wakeAt) { return run(() -> screen.sleep(wakeAt, false)); }
+    @JavascriptInterface public boolean wake() { return run(screen::wake); }
+    @JavascriptInterface public boolean setBrightness(float level) { return run(() -> screen.setBrightness(level)); }
+    @JavascriptInterface public boolean reload() { return run(web::reload); }
+    @JavascriptInterface public String state() { return screen.state(); }
+    @JavascriptInterface public boolean canTurnOff() { return screen.canTurnOff(); }
+
+    private boolean run(Runnable action) {
+      if (!trustedPage()) {
+        Log.w(TAG, "Ignoring " + BRIDGE_NAME + " call from a page outside the saved URL's origin");
+        return false;
+      }
+      handler.post(action);
+      return true;
+    }
+  }
+
+  private boolean trustedPage() {
+    String page = mainUrl;
+    return page != null && sameOrigin(page, savedUrl());
+  }
+
+  /** Same scheme, host and port; a missing port counts as the scheme's default. */
+  static boolean sameOrigin(String a, String b) {
+    Uri x = Uri.parse(a), y = Uri.parse(b);
+    return x.getScheme() != null && x.getScheme().equalsIgnoreCase(y.getScheme())
+        && x.getHost() != null && x.getHost().equalsIgnoreCase(y.getHost())
+        && port(x) == port(y);
+  }
+
+  private static int port(Uri u) {
+    if (u.getPort() != -1) return u.getPort();
+    return "https".equalsIgnoreCase(u.getScheme()) ? 443 : 80;
+  }
+
+  /** Every screen change, including a tap or alarm waking it, reaches the page as "homehq:state". */
+  private void notifyPage(String state) {
+    web.evaluateJavascript("window.dispatchEvent(new CustomEvent('homehq:state', {detail: '" + state + "'}))", null);
   }
 
   /**
@@ -515,11 +579,20 @@ public class MainActivity extends Activity {
     super.onDestroy();
   }
 
-  /** Remote debugging only when explicitly requested; any normal launch turns it back off. */
+  /**
+   * Remote debugging only when explicitly requested; any normal launch turns it back off. A wake
+   * launch (alarm or --ez wake true) leaves it as it was.
+   */
   private void applyDebugFlag(Intent intent) {
+    if (intent != null && intent.getBooleanExtra(EXTRA_WAKE, false)) return;
     boolean debug = intent != null && intent.getBooleanExtra("debug", false);
     WebView.setWebContentsDebuggingEnabled(debug);
     Log.i(TAG, "WebView remote debugging " + (debug ? "ON" : "off"));
+  }
+
+  /** The wake alarm and `--ez wake true` light the screen and clear sleep. */
+  private void applyWakeFlag(Intent intent) {
+    if (intent != null && intent.getBooleanExtra(EXTRA_WAKE, false)) screen.wake();
   }
 
   /** Turns the Home alias on or off. The shell can't enable a component of a release app. */

@@ -49,6 +49,79 @@ can read them, and so can any page shown at that origin. Keep them on a server
 To change the page, rebuild and `adb install -r`. Without `KIOSK_SITE` the APK bundles nothing
 and the address answers 404.
 
+## Screen commands from the page
+
+The page at the saved URL gets a `window.HomeHQ` object for controlling the screen. It is
+`undefined` in a normal browser, so check for it first. In this repository's dashboard,
+`js/kiosk.js` wraps it as `App.kiosk`, with no-ops outside the kiosk.
+
+| Call | Returns | Effect |
+| --- | --- | --- |
+| `sleep()`, `sleep(wakeAtMs)` | `boolean` | Turns the screen off if Home HQ is a device admin (below), otherwise dims it |
+| `dim()`, `dim(wakeAtMs)` | `boolean` | Black screen at minimum brightness. The page keeps running; a tap wakes it |
+| `wake()` | `boolean` | Clears the dim cover, or turns the screen back on, and cancels a pending wake alarm |
+| `setBrightness(level)` | `boolean` | `0` to `1` while Home HQ is in front; `-1` returns to the system setting |
+| `reload()` | `boolean` | Reloads the page |
+| `state()` | `string` | `"awake"`, `"dim"` or `"off"` |
+| `canTurnOff()` | `boolean` | Whether `sleep()` turns the screen off or only dims |
+
+- `wakeAtMs` is a time in epoch milliseconds, passed as a number (`date.getTime()`, not a `Date`).
+  Home HQ sets a native alarm for it, so it wakes the screen even after the CPU sleeps, and brings
+  Home HQ back to the front. There is one alarm: a new `sleep` or `dim` replaces it. A past time
+  or `0` sets none.
+- Actions return `true` once accepted and run a moment later on the UI thread.
+- Brightness set with `setBrightness` comes back after a dim. It isn't saved across restarts.
+- Every change, including a tap or an alarm waking the screen, fires `homehq:state` on `window`,
+  with the new state in `event.detail`.
+
+```js
+const kiosk = window.HomeHQ;
+window.addEventListener('homehq:state', (e) => console.log('screen', e.detail));
+
+const morning = new Date();
+morning.setHours(7, 0, 0, 0);
+if (morning <= new Date()) morning.setDate(morning.getDate() + 1);
+if (kiosk) kiosk.sleep(morning.getTime());
+```
+
+The calls return `false` and do nothing unless the main page is on the saved URL's origin (same
+scheme, host and port), so a sign-in page or another site opened in the kiosk can't use them. If
+the dashboard moves to a new address, save the new URL. Iframes on the page can see
+`window.HomeHQ` too, since the check is on the main page, so only embed frames you trust.
+
+From adb (or anything with ADB access to the frame), this wakes the screen the same way the alarm
+does, even while it is off:
+
+```sh
+adb shell am start -n com.wesbos.homehq/.MainActivity --ez wake true
+```
+
+A wake launch keeps WebView remote debugging as it was, so a sleep and wake can be debugged
+across the alarm.
+
+### Turning the screen off for real
+
+Without setup, `sleep()` only dims: a black screen at minimum brightness, which on some panels
+still lets the backlight glow faintly. To let Home HQ turn the screen off, make it a device admin
+once. It asks only for the lock-screen policy:
+
+```sh
+adb shell dpm set-active-admin com.wesbos.homehq/.AdminReceiver
+```
+
+- Once the screen is off, the page's timers stop when the CPU sleeps. Pass a wake time to `sleep`,
+  or the screen stays off until the power button is pressed. Touch doesn't wake an off screen.
+  To wake on presence from another device (for example a Home Assistant sensor), use `dim()` so
+  the page can still call `wake()`, or wake it over adb as above.
+- If the frame has a lock screen, Home HQ shows above it and dismisses a swipe lock when it wakes.
+- A device admin can't be uninstalled, though `adb install -r` still updates it. To remove Home HQ,
+  first turn off **Home HQ screen off** in Settings → Security → Device admin apps (the menu name
+  varies by firmware). `dpm remove-active-admin` only works for test-only apps on Android 7 and up.
+
+Tested on an AMABOO GBZK-Y1000 (RK3326, Android 8.1, WebView 106) with the device admin set:
+`sleep` with a wake time turned the display off and back on with Wi-Fi ADB connected throughout,
+and `dim` woke on a tap and on its alarm. Not tested on Android 6 frames.
+
 ## Start at boot
 
 To have the frame boot into the dashboard, make the kiosk its Home app. Installing the kiosk
